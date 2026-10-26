@@ -3,11 +3,13 @@ package scraper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,10 +66,31 @@ type GCPScraper struct {
 	cfg            *config.Config
 	client         *http.Client
 	failedServices int64
+	// baseURL overrides the Cloud Billing host. Empty uses gcpBaseURL.
+	// Tests point it at an httptest server so credential handling can be
+	// exercised without the network.
+	baseURL string
 }
 
 func NewGCPScraper(cfg *config.Config) *GCPScraper {
 	return &GCPScraper{cfg: cfg, client: &http.Client{Timeout: 120 * time.Second}}
+}
+
+func (s *GCPScraper) apiBase() string {
+	if s.baseURL != "" {
+		return strings.TrimRight(s.baseURL, "/")
+	}
+	return gcpBaseURL
+}
+
+// errGCPAPIKeyRejected is the credential failure returned to the scrape
+// runner (and stored on scrape_runs). The wording names the env var an
+// operator has to rotate; HTTP status and the RPC reason are appended
+// by gcpAuthError and never include the key or the response body.
+var errGCPAPIKeyRejected = errors.New("GCP API key rejected: check GCP_API_KEY / Cloud Billing API enabled")
+
+func isGCPCredentialError(err error) bool {
+	return errors.Is(err, errGCPAPIKeyRejected)
 }
 
 func (s *GCPScraper) Name() string          { return "GCP" }
@@ -83,11 +106,16 @@ func (s *GCPScraper) ScrapeWithHandler(ctx context.Context, handler ProductHandl
 		concurrency = 1
 	}
 
-	// Resolve discoverable services by display name → ID. Logs and
-	// continues if any lookup fails (a typo in the display name or
-	// a renamed service shouldn't abort the whole scrape).
+	// Resolve discoverable services by display name → ID. A typo or a
+	// renamed service is logged and the scrape continues with the
+	// hard-coded IDs. A credential rejection does not: every later call
+	// would fail the same way, and swallowing it is what used to leave
+	// scrape_runs with a generic "0 products" error.
 	resolved, err := s.resolveDiscoverableServices(ctx)
 	if err != nil {
+		if isGCPCredentialError(err) {
+			return err
+		}
 		slog.Warn("service discovery failed; proceeding with hard-coded services only",
 			"vendor", "gcp", "error", err)
 		resolved = nil
@@ -114,6 +142,14 @@ func (s *GCPScraper) ScrapeWithHandler(ctx context.Context, handler ProductHandl
 			slog.Info("scraping service", "vendor", "gcp", "service", serviceName, "service_id", serviceID)
 			products, err := s.scrapeService(gctx, serviceName, serviceID)
 			if err != nil {
+				// Same key on every call. Surface it so the run fails
+				// with the Cloud Billing status instead of N swallowed
+				// warnings and a generic zero-product error. Checked
+				// before the context so a sibling's cancellation does
+				// not hide the rejection.
+				if isGCPCredentialError(err) {
+					return err
+				}
 				if gctx.Err() != nil {
 					return gctx.Err()
 				}
@@ -175,7 +211,7 @@ func (s *GCPScraper) resolveDiscoverableServices(ctx context.Context) (map[strin
 		// URL: a failed request wraps the full URL into *url.Error,
 		// which would put a ?key=… secret into logs. (The SKU fetch
 		// path does the same — keep them consistent.)
-		listURL := fmt.Sprintf("%s/services?pageSize=500", gcpBaseURL)
+		listURL := fmt.Sprintf("%s/services?pageSize=500", s.apiBase())
 		if pageToken != "" {
 			listURL += "&pageToken=" + pageToken
 		}
@@ -191,6 +227,9 @@ func (s *GCPScraper) resolveDiscoverableServices(ctx context.Context) (map[strin
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
+			if authErr := gcpAuthError(resp.StatusCode, string(body)); authErr != nil {
+				return out, authErr
+			}
 			return out, fmt.Errorf("GCP services list HTTP %d: %s", resp.StatusCode, string(body))
 		}
 		var page struct {
@@ -476,12 +515,96 @@ var gcpFamilyRAMPatterns = map[string]string{
 	"t2a": "T2A Arm Instance Ram",
 }
 
+// gcpCredentialReasons are Cloud Billing / API-key RPC reasons that mean
+// the credential or the project's access to the API is unusable. A bare
+// HTTP 400 is not enough: an expired page token is also 400 and must
+// stay a per-service failure.
+var gcpCredentialReasons = map[string]struct{}{
+	"API_KEY_INVALID":                 {},
+	"API_KEY_EXPIRED":                 {},
+	"API_KEY_SERVICE_BLOCKED":         {},
+	"API_KEY_IP_ADDRESS_BLOCKED":      {},
+	"API_KEY_HTTP_REFERRER_BLOCKED":   {},
+	"API_KEY_ANDROID_APP_BLOCKED":     {},
+	"API_KEY_IOS_APP_BLOCKED":         {},
+	"SERVICE_DISABLED":                {},
+	"ACCESS_NOT_CONFIGURED":           {},
+	"CONSUMER_INVALID":                {},
+	"CONSUMER_SUSPENDED":              {},
+	"BILLING_DISABLED":                {},
+	"PERMISSION_DENIED":               {},
+	"UNAUTHENTICATED":                 {},
+	"ACCESS_TOKEN_SCOPE_INSUFFICIENT": {},
+}
+
+var (
+	gcpReasonRE = regexp.MustCompile(`"reason"\s*:\s*"([A-Z][A-Z0-9_]*)"`)
+	gcpStatusRE = regexp.MustCompile(`"status"\s*:\s*"([A-Z][A-Z0-9_]*)"`)
+)
+
+// gcpAuthError returns errGCPAPIKeyRejected when the Cloud Billing
+// response is rejecting the caller. HTTP 401 and 403 always are. HTTP
+// 400 is only when the body names a credential reason (API_KEY_INVALID
+// and the like); other 400s are bad requests and must not abort the run.
+// The returned error never includes the response body.
+func gcpAuthError(status int, body string) error {
+	if !gcpCredentialRejection(status, body) {
+		return nil
+	}
+	detail := gcpErrorReason(body)
+	if detail == "" {
+		detail = gcpRPCStatus(body)
+	}
+	if detail == "" {
+		return fmt.Errorf("%w (HTTP %d)", errGCPAPIKeyRejected, status)
+	}
+	return fmt.Errorf("%w (HTTP %d %s)", errGCPAPIKeyRejected, status, detail)
+}
+
+func gcpCredentialRejection(status int, body string) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	case http.StatusBadRequest:
+		return gcpBodySaysCredential(body)
+	default:
+		return false
+	}
+}
+
+func gcpBodySaysCredential(body string) bool {
+	if strings.Contains(body, "API key not valid") {
+		return true
+	}
+	if _, ok := gcpCredentialReasons[gcpErrorReason(body)]; ok {
+		return true
+	}
+	_, ok := gcpCredentialReasons[gcpRPCStatus(body)]
+	return ok
+}
+
+func gcpErrorReason(body string) string {
+	m := gcpReasonRE.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func gcpRPCStatus(body string) string {
+	m := gcpStatusRE.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 // fetchGCPPage fetches a single page of SKUs from the GCP Cloud Billing API with
 // retry logic and proper error handling.
 func (s *GCPScraper) fetchGCPPage(ctx context.Context, serviceID, pageToken string) (*gcpSKUListResponse, error) {
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		reqURL := fmt.Sprintf("%s/services/%s/skus?pageSize=5000", gcpBaseURL, serviceID)
+		reqURL := fmt.Sprintf("%s/services/%s/skus?pageSize=5000", s.apiBase(), serviceID)
 		if pageToken != "" {
 			reqURL += "&pageToken=" + url.QueryEscape(pageToken)
 		}
@@ -509,6 +632,13 @@ func (s *GCPScraper) fetchGCPPage(ctx context.Context, serviceID, pageToken stri
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			// Auth and permission rejections are permanent for this
+			// process. Retrying them just delays the same failure, and
+			// the body can echo request metadata, so it stays out of
+			// the error that scrape_runs will store.
+			if authErr := gcpAuthError(resp.StatusCode, string(body)); authErr != nil {
+				return nil, authErr
+			}
 			if attempt < maxRetries-1 && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
 				slog.Warn("GCP HTTP error, retrying", "service_id", serviceID, "status", resp.StatusCode, "attempt", attempt+1)
 				select {

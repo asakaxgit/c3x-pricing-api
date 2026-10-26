@@ -77,4 +77,6 @@ To rehearse without touching production, restore into a scratch Postgres
 every 3 hours and fails when any vendor is `failed`, `stale`, `empty` or
 `never`. On failure it opens one issue titled `Pricing API: vendor data
 unhealthy` (label `status-monitor`), or comments on it if it is already
-open, so a long outage does not spam; close the issue once fixed.
+open, so a long outage does not spam; close the issue once fixed. The
+job log and the comment include each unhealthy vendor's `lastError` when
+`/status` sends one (the redacted error from the latest failed scrape).

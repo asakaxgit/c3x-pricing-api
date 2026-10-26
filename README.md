@@ -47,7 +47,7 @@ c3x estimate --path /path/to/terraform
 | Endpoint | Method | Description |
 |---|---|---|
 | `/graphql` | POST | GraphQL pricing queries (supports batched requests) |
-| `/status`  | GET | Scrape status and product counts per vendor (JSON). Per-vendor `status` is one of `ready`, `empty`, `failed`, `stale`, `scraping`, `never`; see below. |
+| `/status`  | GET | Scrape status and product counts per vendor (JSON). Per-vendor `status` is one of `ready`, `empty`, `failed`, `stale`, `scraping`, `never`. `lastError`, when present, is the redacted error from that vendor's most recent failed scrape. See below. |
 | `/healthz` | GET | Liveness probe, no DB dependency |
 | `/readyz` | GET | Readiness probe, pings the DB |
 | `/health`  | GET | Backwards-compatible alias for `/readyz` |
@@ -70,6 +70,16 @@ actionable one wins when several apply:
 scrapes nothing while the API keeps serving the rows it already had. The
 data stays available and correct-as-of-its-last-good-scrape, but it stops
 advancing, and the status is what tells you so.
+
+`lastError` is the `error` column of that vendor's most recent failed
+`scrape_runs` row. It is omitted when the vendor has no failed run on
+record, including after the row ages out of retention, so a client that
+only reads `status`, `products` and `lastScraped` sees the same shape as
+before. The text is redacted before it is written to the response: known
+key formats (Google API keys, AWS access key ids), query-string
+credentials, `Bearer` tokens, URL userinfo, and the API key and database
+URL configured on this process. It is a single line and capped at 1000
+characters.
 
 ## Deploying
 

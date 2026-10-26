@@ -339,6 +339,16 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "c3x pricing API. Docs: https://c3x.dev/docs/self-hosted/  Query endpoint: POST /graphql\n")
 }
 
+// vendorInfo is one vendor in the /status payload. lastError is additive:
+// it is the redacted scrape_runs.error of the most recent failed run, and
+// it is omitted when that vendor has no failed run on record.
+type vendorInfo struct {
+	Status      string `json:"status"`
+	Products    int64  `json:"products"`
+	LastScraped string `json:"lastScraped,omitempty"`
+	LastError   string `json:"lastError,omitempty"`
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -347,12 +357,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-
-	type vendorInfo struct {
-		Status      string `json:"status"`
-		Products    int64  `json:"products"`
-		LastScraped string `json:"lastScraped,omitempty"`
-	}
 
 	vendors := map[string]*vendorInfo{
 		"aws":   {Status: "never"},
@@ -421,6 +425,25 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	// Most recent failed run per vendor. Distinct from the latest run:
+	// a vendor that has since succeeded still reports that failure's
+	// error, and a vendor that has never failed omits lastError.
+	rows3, err := s.db.Pool.Query(ctx, `
+		SELECT DISTINCT ON (vendor) vendor, error
+		FROM scrape_runs
+		WHERE status = 'failed'
+		ORDER BY vendor, id DESC`)
+	if err == nil {
+		for rows3.Next() {
+			var vendor string
+			var errText *string
+			if rows3.Scan(&vendor, &errText) == nil && errText != nil {
+				setVendorLastError(vendors, vendor, redactConfiguredSecrets(s.cfg, *errText))
+			}
+		}
+		rows3.Close()
 	}
 
 	for vendor, fct := range seen {
@@ -1021,6 +1044,19 @@ func vendorStatus(sawSuccess bool, successProducts int64, latestStatus string, f
 		return "stale"
 	}
 	return "ready"
+}
+
+// setVendorLastError publishes one vendor's most recent failed-run error.
+// Unknown vendors are ignored so a stray scrape_runs row cannot add a key
+// to the payload. The text is redacted and collapsed to one line first.
+func setVendorLastError(vendors map[string]*vendorInfo, vendor, raw string) {
+	v, ok := vendors[vendor]
+	if !ok {
+		return
+	}
+	if msg := exposeScrapeError(raw); msg != "" {
+		v.LastError = msg
+	}
 }
 
 // redactSensitiveParams removes credential-related query parameters from URLs before logging.

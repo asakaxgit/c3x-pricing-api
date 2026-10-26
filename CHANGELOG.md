@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/status` adds `lastError` on each vendor: the `error` stored on that
+  vendor's most recent failed `scrape_runs` row. Secrets are redacted
+  first (Google API keys, AWS access key ids, query-string credentials,
+  `Bearer` tokens, URL userinfo, and the key and database URL configured
+  on the process). The field is omitted when there is nothing to report.
+  `status`, `products` and `lastScraped` are unchanged.
+- `.github/workflows/status-monitor.yml` prints that error next to each
+  unhealthy vendor, in the job log and in the issue comment. The comment
+  is still posted only when that text changes, so a long outage does not
+  spam.
+
+### Changed
+- GCP scraper: an auth or permission rejection from the Cloud Billing
+  API fails the run with
+  `GCP API key rejected: check GCP_API_KEY / Cloud Billing API enabled`,
+  plus the HTTP status and RPC reason.
+  That covers HTTP 401 and 403, and HTTP 400 whose body names
+  `API_KEY_INVALID`, `SERVICE_DISABLED` and similar credential reasons.
+  The response body is not included. Any other per-service failure,
+  including an HTTP 400 for a bad page token, is still logged and
+  swallowed so one flaky service cannot abort a vendor.
+
 ## [1.2.1] - 2026-10-23
 
 ### Security

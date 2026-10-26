@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,6 +60,59 @@ func TestVendorStatus(t *testing.T) {
 // TestVendorStatusNeverReportsReadyWithoutData is the invariant that matters:
 // no combination of inputs may report "ready" while the last successful
 // scrape ingested nothing.
+func TestVendorLastErrorIsAdditiveAndRedacted(t *testing.T) {
+	t.Parallel()
+	gcpKey := "AIza" + strings.Repeat("k", 35)
+	vendors := map[string]*vendorInfo{
+		"aws":   {Status: "ready", Products: 10},
+		"azure": {Status: "ready", Products: 10},
+		"gcp":   {Status: "failed", Products: 0},
+	}
+	setVendorLastError(vendors, "gcp", "rejected key "+gcpKey+"\nsecond line")
+	setVendorLastError(vendors, "azure", "   ")
+	setVendorLastError(vendors, "other", "should not appear")
+
+	if vendors["azure"].LastError != "" {
+		t.Fatalf("blank error was published: %q", vendors["azure"].LastError)
+	}
+	if strings.Contains(vendors["gcp"].LastError, gcpKey) || strings.Contains(vendors["gcp"].LastError, "\n") {
+		t.Fatalf("lastError = %q", vendors["gcp"].LastError)
+	}
+	if vendors["gcp"].LastError != "rejected key [REDACTED] second line" {
+		t.Fatalf("lastError = %q", vendors["gcp"].LastError)
+	}
+
+	body, err := json.Marshal(vendors["gcp"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gcp struct {
+		Status    string `json:"status"`
+		Products  int64  `json:"products"`
+		LastError string `json:"lastError"`
+	}
+	if err := json.Unmarshal(body, &gcp); err != nil {
+		t.Fatal(err)
+	}
+	if gcp.Status != "failed" || gcp.Products != 0 || gcp.LastError == "" {
+		t.Fatalf("gcp payload = %+v", gcp)
+	}
+	if strings.Contains(string(body), gcpKey) {
+		t.Fatalf("JSON leaked the key: %s", body)
+	}
+	// Vendors with no failed run omit the field. An empty string would
+	// still be a shape change for clients that treat presence as failure.
+	for _, name := range []string{"aws", "azure"} {
+		frag, err := json.Marshal(vendors[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(frag), "lastError") {
+			t.Fatalf("%s JSON includes lastError: %s", name, frag)
+		}
+	}
+}
+
 func TestVendorStatusNeverReportsReadyWithoutData(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
