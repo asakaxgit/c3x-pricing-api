@@ -72,6 +72,15 @@ Endpoint: `https://cloudbilling.googleapis.com/v1/services/<id>/skus`
 - ⚠ **Requires an API key.** Free tier is generous; create one in the Google
   Cloud Console. Without `GCP_API_KEY`, `scrape --vendor gcp` fails fast (we
   check at command boundary, not deep inside the HTTP call).
+- ⚠ **A revoked key, a disabled Cloud Billing API, or a permission block
+  fails the whole run.** The API answers those in one small JSON body
+  (HTTP 401/403, or HTTP 400 with `API_KEY_INVALID` / `SERVICE_DISABLED`
+  and similar reasons) long before any SKU page is useful. 🔧 The scraper
+  returns `GCP API key rejected: check GCP_API_KEY / Cloud Billing API enabled`
+  instead of logging one warning per service and recording a
+  generic "0 products" failure. A 400 that is not a credential reason
+  (an expired page token) stays a per-service failure. `/status` then
+  shows the stored text as `lastError`, with secrets redacted.
 - ⚠ **`Units` is a decimal string**, not a JSON number, to preserve precision.
   🔧 Parse as `int64` and combine with `Nanos` (int64): `units + nanos/1e9`.
 - ⚠ **Sustained Use Discount (SUD) and Committed Use Discount (CUD) prices

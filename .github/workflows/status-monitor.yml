@@ -2,9 +2,9 @@ name: Status monitor
 
 # Polls the public /status endpoint and raises a GitHub issue when a
 # vendor's pricing data is unhealthy. One issue (fixed title + label) is
-# reused while it stays open; it is commented on only when the set of
-# unhealthy vendors changes, so a long outage does not spam. Close the
-# issue once fixed; the next unhealthy run opens a fresh one.
+# reused while it stays open; it is commented on only when the unhealthy
+# vendors or their lastError text changes, so a long outage does not spam.
+# Close the issue once fixed; the next unhealthy run opens a fresh one.
 
 on:
   schedule:
@@ -40,17 +40,49 @@ jobs:
              && echo "$body" | jq -e '.vendors | type == "object"' > /dev/null; then
             echo "$body" | jq . | tee status.json
             # Healthy = ready or scraping. failed/stale/empty/never mean the
-            # served prices are frozen, old or missing.
-            jq -r '.vendors | to_entries[]
-                   | select(.value.status as $s | ["ready","scraping"] | index($s) | not)
-                   | "\(.key)=\(.value.status)"' status.json | sort > unhealthy.txt
+            # served prices are frozen, old or missing. lastError is optional
+            # (older servers omit it) and is the redacted scrape error.
+            : > unhealthy.txt
+            {
+              echo "| Vendor | Status | Last error |"
+              echo "|---|---|---|"
+              jq -r '.vendors | to_entries | sort_by(.key)[]
+                     | select(.value.status as $s | ["ready","scraping"] | index($s) | not)
+                     | [.key, .value.status, (.value.lastError // "")]
+                     | @tsv' status.json | while IFS=$'\t' read -r vendor status errtext; do
+                # One line, no marker/table breakers. The state line is what
+                # decides whether to comment again, so a stable error does
+                # not spam and a newly visible one posts once.
+                errtext="${errtext//$'\r'/ }"
+                errtext="${errtext//$'\n'/ }"
+                errtext="${errtext//|/\/}"
+                errtext="${errtext//\`/\'}"
+                errtext="${errtext//</\&lt;}"
+                errtext="${errtext//>/\&gt;}"
+                errtext="${errtext//--/-}"
+                if [ -z "$errtext" ]; then
+                  printf '| `%s` | **%s** | - |\n' "$vendor" "$status"
+                  printf '%s=%s\n' "$vendor" "$status" >> unhealthy.txt
+                else
+                  printf '| `%s` | **%s** | %s |\n' "$vendor" "$status" "$errtext"
+                  printf '%s=%s: %s\n' "$vendor" "$status" "$errtext" >> unhealthy.txt
+                fi
+              done
+            } > vendor_table.md
           else
             echo "status endpoint unreachable or returned an unexpected body" | tee status.json
             echo "status-endpoint=unreachable" > unhealthy.txt
+            {
+              echo "| Vendor | Status | Last error |"
+              echo "|---|---|---|"
+              printf '| `%s` | **%s** | - |\n' "status-endpoint" "unreachable"
+            } > vendor_table.md
           fi
           if [ -s unhealthy.txt ]; then
             echo "healthy=false" >> "$GITHUB_OUTPUT"
             echo "state=$(paste -sd, unhealthy.txt)" >> "$GITHUB_OUTPUT"
+            echo "Unhealthy vendors:"
+            cat unhealthy.txt
           else
             echo "healthy=true" >> "$GITHUB_OUTPUT"
           fi
@@ -65,11 +97,10 @@ jobs:
           {
             echo "The scheduled status check found unhealthy pricing data at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
             echo
-            echo "| Vendor | Status |"
-            echo "|---|---|"
-            tr '=' ' ' < unhealthy.txt | while read -r vendor status; do echo "| \`$vendor\` | **$status** |"; done
+            cat vendor_table.md
             echo
             echo "Status meanings: \`failed\` = latest scrape failed (served data frozen), \`stale\` = nothing finished in 48h, \`empty\` = last successful scrape ingested 0 products, \`never\` = no scrape has run."
+            echo "Last error is \`lastError\` from \`/status\`: the redacted \`scrape_runs.error\` of that vendor's most recent failed run, when the endpoint provides one."
             echo
             echo "<details><summary>/status response</summary>"
             echo
@@ -107,5 +138,8 @@ jobs:
         env:
           STATE: ${{ steps.status.outputs.state }}
         run: |
-          echo "::error::Unhealthy vendors: ${STATE}"
+          # % starts a workflow-command escape (%0A is a newline). The
+          # status text is already one line; escape the percent signs so a
+          # scrape error cannot inject another command.
+          echo "::error::Unhealthy vendors: ${STATE//%/%25}"
           exit 1

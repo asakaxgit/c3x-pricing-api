@@ -98,10 +98,10 @@ type Scraper interface {
 
 1. Acquires `pg_try_advisory_lock(hashtext('scrape:<vendor>'))` on a dedicated pool connection. If another run holds it, this process skips with a warning.
 2. Inserts a `scrape_runs` row with `status='running'` and the DB's `now()` timestamp.
-3. Calls `Scraper.Scrape(ctx)`. Each scraper fans out across services with `errgroup.WithContext` + `SetLimit(cfg.ScrapeConcurrency)`. Per-service errors are logged but do not abort siblings; ctx cancellation (SIGTERM) does abort.
+3. Calls `Scraper.Scrape(ctx)`. Each scraper fans out across services with `errgroup.WithContext` + `SetLimit(cfg.ScrapeConcurrency)`. Per-service errors are logged but do not abort siblings; ctx cancellation (SIGTERM) does abort. A GCP credential rejection (HTTP 401/403, or HTTP 400 with a reason such as `API_KEY_INVALID` or `SERVICE_DISABLED`) is the exception: it fails that vendor's run with an error that names `GCP_API_KEY`, because every other call would fail the same way.
 4. `UpsertProducts` writes in 1000-row batches (8-column batch size stays well under Postgres's 65,535 parameter cap). The `ON CONFLICT ... DO UPDATE` only fires when `prices`, `attributes` or `sku` actually differ, so an unchanged product is not rewritten and `updated_at` means "content last changed". Each batch is also recorded in the narrow, UNLOGGED `scrape_seen (run_id, product_hash)` table.
 5. `DeleteStaleProducts` removes the vendor's rows with `updated_at < scrapeStart` (the DB's own `now()`, not wall-clock) that are not in this run's `scrape_seen` set. It is skipped when any service/region failed, when the product count dropped by half, or when the seen-set is under half the ingested count (a Postgres crash truncates UNLOGGED tables). The run's `scrape_seen` rows are dropped when it ends.
-6. Updates `scrape_runs` with `status`, `products`, `deleted`, optional `error`.
+6. Updates `scrape_runs` with `status`, `products`, `deleted`, optional `error`. `/status` reports that error as `lastError` on the vendor's most recent failed run, after redacting credentials.
 
 ## Freshness
 
